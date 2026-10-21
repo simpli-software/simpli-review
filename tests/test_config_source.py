@@ -65,7 +65,10 @@ def test_pr_that_sets_block_on_none_still_blocks_and_says_the_config_changed(mon
 def test_pr_that_ignores_everything_is_still_reviewed(monkeypatch, repo):
     head = {CFG: json.dumps({"ignorePatterns": "**"})}
     changed = [BILLING, _edit(CFG, "{}", '{"ignorePatterns": "**"}')]
-    code = _run(monkeypatch, repo, head_files=head, changed_files=changed, review=_review([_finding()]))
+    code = _run(
+        monkeypatch, repo, config={"verify": {"enabled": False}}, head_files=head, changed_files=changed,
+        review=_review([_finding()]),
+    )  # fmt: skip
     assert code == 0
     assert _GH.client is not None and len(_GH.client.requests) == 1  # the model was asked
     assert len(_GH.calls["inline"]) == 1 and "Configuration changes in this PR" in _GH.calls["summary"]

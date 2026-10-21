@@ -50,6 +50,7 @@ from simpli_review.memory import (
     since_last_block,
 )
 from simpli_review.models import BlockDecision, ReviewResult
+from simpli_review.pricing import estimate_micros, format_usd
 from simpli_review.render import SUMMARY_MARKER, inline_body, summary_body
 from simpli_review.report import build_report
 from simpli_review.reviewer import (
@@ -58,13 +59,17 @@ from simpli_review.reviewer import (
     ReviewFailed,
     Settings,
     build_user_message,
+    existing_titles,
     finalize,
+    repo_context_parts,
     run_review,
+    screen,
     to_github_comments,
     usage_line,
 )
 from simpli_review.scrub import api_error_text
 from simpli_review.tools import Toolbox
+from simpli_review.verifier import reconcile_summary, verification_json, verify_findings
 
 log = logging.getLogger("simpli_review")
 TRUSTED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
@@ -318,6 +323,7 @@ def _github_run(dry_run: bool, loaded: list[Config] | None = None) -> int:
     print(f"Review: {len(outcome.posted)} inline, {len(outcome.unplaced)} in summary, "
           f"{outcome.filtered} filtered, {outcome.suppressed} suppressed, {outcome.duplicates} duplicates, "
           f"{outcome.turns} turns, tokens {usage_line(outcome.usage)}")  # fmt: skip
+    print(cost_line(settings_from_env().model, outcome))
     if dry_run:
         print(summary)
         for c in to_github_comments(outcome.posted, inline_body):
@@ -342,6 +348,17 @@ def _github_run(dry_run: bool, loaded: list[Config] | None = None) -> int:
     gh.upsert_issue_comment(number, SUMMARY_MARKER, summary)
     gh.set_status_reaction(number, "+1", me)
     return _exit_code(decision, name)
+
+
+def cost_line(model: str, outcome: Outcome) -> str:
+    """Estimated spend of the review, the reviewer and the verifier priced separately (pricing.py)."""
+    parts = [f"reviewer {model} {format_usd(estimate_micros(model, outcome.usage))}"]
+    v = outcome.verification
+    if v is not None:
+        counts = ", ".join(f"{k} {n}" for k, n in v.counts().items())
+        cost = format_usd(estimate_micros(v.model, v.usage))
+        parts.append(f"verifier {v.model} {cost} (tokens {usage_line(v.usage)}; {counts})")
+    return "Estimated cost: " + "; ".join(parts)
 
 
 def _exit_code(decision: BlockDecision, name: str) -> int:
@@ -387,7 +404,7 @@ def _render_summary(
         include_diagram=config.include_diagram, review_count=review_count, mention=mention,
         since_last=since_last_block(since), re_review_label=re_review_label, checks=outcome.checks,
         block=decision, agent_prompt=combined_details(tasks), override_label=override_label,
-        config_changes=config_changes, config_source=config_source,
+        config_changes=config_changes, config_source=config_source, verification=outcome.verification,
     )  # fmt: skip
 
 
@@ -425,12 +442,29 @@ def _review(
         prior=prior,
         source=source,
     )
+    client = anthropic.Anthropic()
+    settings = settings_from_env()
     result, turns, usage = run_review(
-        anthropic.Anthropic(), settings_from_env(), user, Toolbox(repo_root, index),
+        client, settings, user, Toolbox(repo_root, index),
         on_turn=lambda t: print(f"turn {t}", flush=True, file=progress or sys.stdout),
     )  # fmt: skip
+    verification = None
+    if config.verify.enabled:
+        # Only what finalize would keep is worth checking: filtered, suppressed and repeated ones go anyway.
+        seen = existing_titles(existing)
+        # Team instructions, rules and context files as the reviewer got them: from the base commit.
+        parts = repo_context_parts(config, repo_root, [p.path for p in patches], source)
+        context = "# Repository context\n\n" + "\n\n".join(parts) if parts else ""
+        kept, verification = verify_findings(
+            client, settings, result.findings, patches=patches, config=config,
+            make_toolbox=lambda: Toolbox(repo_root, index), context=context,
+            should_verify=lambda f: screen(f, config, feedback, seen) is None,
+        )  # fmt: skip
+        result = result.model_copy(update={"findings": kept})
+        result = reconcile_summary(client, settings, result, verification, Toolbox(repo_root, index))
     outcome = finalize(result, patches=patches, config=config, feedback=feedback, existing_comments=existing)
     outcome.turns, outcome.usage = turns, usage
+    outcome.verification = verification
     outcome.prior = prior
     # A local review has no PR description, so the PR-template check does not apply to it.
     outcome.checks = build_rows(
@@ -535,10 +569,12 @@ def local_main(base: str, repo: str, as_json: bool = False) -> int:
     # No PR here, so no labels: an override label never applies to a local review.
     since, tasks, decision = _gate(outcome, config, [])
     print(f"tokens: {usage_line(outcome.usage)}", file=sys.stderr)
+    print(cost_line(settings_from_env().model, outcome), file=sys.stderr)
     if as_json:
         print(json.dumps(build_report(result=outcome.result, posted=outcome.posted, unplaced=outcome.unplaced,
                                       checks=outcome.checks, decision=decision, tasks=tasks,
-                                      config_source=source.label, config_changes=changes)))  # fmt: skip
+                                      config_source=source.label, config_changes=changes,
+                                      verification=verification_json(outcome.verification))))  # fmt: skip
         return EXIT_BLOCKED if decision.blocking else 0
     name = _env("INPUT_NAME", "Code review")
     print(_render_summary(name, outcome, config, pr.head_sha, len(patches), 1, default_mention(name),

@@ -112,6 +112,36 @@ class ScanConfig(_Model):
     min_severity: Literal["P0", "P1", "P2"] = Field(default="P1", alias="minSeverity")
 
 
+class VerifyConfig(_Model):
+    """`verify` block: a second, fresh-context check of each serious finding before it is posted.
+
+    Each candidate goes to its own short agent run (read-only tools, no access to the reviewer's
+    conversation) that keeps it, lowers its severity one step, or drops it. A verification that fails or
+    runs out of time keeps the finding, marked unverified; nothing is ever dropped on an error.
+    """
+
+    enabled: bool = True
+    model: str = Field(default="claude-sonnet-5-5", pattern=r"^[A-Za-z0-9._:/@-]{1,100}$")
+    effort: Effort = "medium"
+    severities: list[Literal["P0", "P1", "P2"]] = Field(
+        default_factory=lambda: list[Literal["P0", "P1", "P2"]](["P0", "P1"]), min_length=1
+    )
+    # A finding whose verdict confidence is below this is dropped.
+    min_confidence: int = Field(default=3, ge=1, le=5, alias="minConfidence")
+    max_turns: int = Field(default=8, ge=1, le=30, alias="maxTurns")
+    # Per verification: input + cache read + cache write + output tokens, summed over its turns.
+    max_tokens: int = Field(default=250_000, ge=10_000, le=2_000_000, alias="maxTokens")
+    timeout_seconds: int = Field(default=240, ge=10, le=1800, alias="timeoutSeconds")
+    concurrency: int = Field(default=4, ge=1, le=8)
+
+    @field_validator("severities")
+    @classmethod
+    def _unique_severities(cls, v: list[str]) -> list[str]:
+        if len(set(v)) != len(v):
+            raise ValueError("severities must not repeat")
+        return v
+
+
 class Config(_Model):
     # 1 = everything worth saying, 2 = default, 3 = only P0/critical.
     strictness: Literal[1, 2, 3] = 2
@@ -146,6 +176,7 @@ class Config(_Model):
     # A PR with this label is never blocked; the summary says the block was overridden.
     override_label: str = Field(default="review-override", alias="overrideLabel")
     scan: ScanConfig = Field(default_factory=ScanConfig)
+    verify: VerifyConfig = Field(default_factory=VerifyConfig)
 
     @field_validator("checks")
     @classmethod

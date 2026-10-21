@@ -40,6 +40,7 @@ def build_report(
     tasks: list[AgentTask],
     config_source: str = "",
     config_changes: list[str] | None = None,
+    verification: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "summary": result.summary,
@@ -55,4 +56,7 @@ def build_report(
         # and which of those files this branch edits (they apply after merge, not to this review).
         "config_source": config_source,
         "config_changes": config_changes or [],
+        # The verifier pass (`verify` config), or null when it did not run: every finding it checked as the
+        # reviewer wrote it, the outcome (kept, downgraded, dropped, unverified) and its tokens.
+        "verification": verification,
     }

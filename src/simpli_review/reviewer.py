@@ -20,7 +20,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import anthropic
 from pydantic import ValidationError
@@ -35,6 +35,9 @@ from simpli_review.memory import PriorFinding, prompt_section
 from simpli_review.models import CheckRow, Finding, ReviewResult, Severity
 from simpli_review.tools import TOOLS, Toolbox, ToolError
 
+if TYPE_CHECKING:
+    from simpli_review.verifier import Verification
+
 log = logging.getLogger(__name__)
 
 MAX_DIFF_CHARS = 250_000
@@ -42,7 +45,19 @@ MAX_CONTEXT_FILE_CHARS = 20_000
 MAX_GRAPH_SYMBOLS = 25
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
-SYSTEM_PROMPT = """\
+SEVERITY_GUIDE = (
+    "Severity: P0 = must not merge (security hole, data loss, crash on a main path). P1 = should be fixed "
+    "before merge (a real bug or a regression). P2 = worth fixing (edge case, robustness, clarity that "
+    "prevents a likely mistake)."
+)
+
+CONFIDENCE_GUIDE = (
+    "Confidence score (0-5) for the whole PR: 5 = safe to merge; lower it for unresolved findings and "
+    "for risky areas (auth, payments, migrations, concurrency) even when nothing concrete is wrong."
+)
+
+SYSTEM_PROMPT = (
+    """\
 You are a senior engineer reviewing a pull request. You have the whole repository, a code graph, \
 and read-only tools. Your comments go straight onto the PR, so every one must be worth the author's time.
 
@@ -61,9 +76,9 @@ secrets, tenant isolation); data loss or corruption; concurrency and transaction
 that hides failures; breaking changes to callers, APIs or schemas; missing migrations or config; \
 then performance, then maintainability.
 
-Severity: P0 = must not merge (security hole, data loss, crash on a main path). P1 = should be fixed \
-before merge (a real bug or a regression). P2 = worth fixing (edge case, robustness, clarity that \
-prevents a likely mistake). Type: logic, syntax, or style.
+"""
+    + SEVERITY_GUIDE
+    + """ Type: logic, syntax, or style.
 
 Line numbers: use the NEW-file line numbers shown in the left gutter of the annotated diff. A \
 comment must sit on a line that appears in the diff. If the problem is in unchanged code that the \
@@ -72,8 +87,9 @@ change breaks, put the comment on the changed line that causes it.
 Suggestions: when the fix is local and certain, give the exact replacement for the lines \
 line..end_line (new side) in `suggestion`. Otherwise leave it null.
 
-Confidence score (0-5) for the whole PR: 5 = safe to merge; lower it for unresolved findings and \
-for risky areas (auth, payments, migrations, concurrency) even when nothing concrete is wrong.
+"""
+    + CONFIDENCE_GUIDE
+    + """
 
 Diagram: for a non-trivial change, add a small mermaid diagram of the flow or structure it \
 changes (sequenceDiagram, flowchart, classDiagram or erDiagram). Null for trivial changes.
@@ -91,6 +107,7 @@ problem is also a real defect.
 
 Finish by calling submit_review exactly once with the complete review. Do not write the review as \
 plain text."""
+)
 
 
 @dataclass
@@ -125,6 +142,7 @@ class Outcome:
     usage: dict[str, int] = field(default_factory=dict)
     prior: list[PriorFinding] = field(default_factory=list)  # earlier findings on this PR (re-reviews)
     checks: list[CheckRow] = field(default_factory=list)  # the pre-merge checks table
+    verification: Verification | None = None  # the verifier pass, when `verify.enabled`
 
 
 class ReviewFailed(Exception):
@@ -463,6 +481,34 @@ def run_review(
 # ---------- after the model ----------
 
 
+ExistingTitles = list[tuple[Any, set[str]]]
+
+
+def existing_titles(existing_comments: list[dict[str, Any]]) -> ExistingTitles:
+    """(path, title words) of this reviewer's comments already on the PR."""
+    from simpli_review.render import parse_finding_marker
+
+    return [
+        (c.get("path"), words(parse_finding_marker(c.get("body") or "").get("title", "")))
+        for c in existing_comments
+        if parse_finding_marker(c.get("body") or "")
+    ]
+
+
+def screen(
+    f: Finding, config: Config, feedback: Feedback | None, existing: ExistingTitles
+) -> Literal["filtered", "suppressed", "duplicate"] | None:
+    """Why `finalize` would leave this finding out, or None when it would keep it."""
+    if not config.keeps(f):
+        return "filtered"
+    if feedback and feedback.suppresses(f):
+        return "suppressed"
+    tw = words(f.title)
+    if any(path == f.path and similarity(tw, ew) >= 0.6 for path, ew in existing):
+        return "duplicate"
+    return None
+
+
 def finalize(
     result: ReviewResult,
     *,
@@ -472,29 +518,21 @@ def finalize(
     existing_comments: list[dict[str, Any]],
 ) -> Outcome:
     """Place, filter, de-duplicate and cap the model's findings."""
-    from simpli_review.render import parse_finding_marker
-
     by_path = {p.path: p for p in patches}
     outcome = Outcome(result=result)
-    existing = [
-        (c.get("path"), words(parse_finding_marker(c.get("body") or "").get("title", "")))
-        for c in existing_comments
-        if parse_finding_marker(c.get("body") or "")
-    ]
+    existing = existing_titles(existing_comments)
 
     candidates: list[Finding] = []
     for f in result.findings:
-        if not config.keeps(f):
+        why = screen(f, config, feedback, existing)
+        if why == "filtered":
             outcome.filtered += 1
-            continue
-        if feedback and feedback.suppresses(f):
+        elif why == "suppressed":
             outcome.suppressed += 1
-            continue
-        tw = words(f.title)
-        if any(path == f.path and similarity(tw, ew) >= 0.6 for path, ew in existing):
+        elif why == "duplicate":
             outcome.duplicates += 1
-            continue
-        candidates.append(f)
+        else:
+            candidates.append(f)
 
     order = {Severity.P0: 0, Severity.P1: 1, Severity.P2: 2}
     candidates.sort(key=lambda f: (order[f.severity], -f.confidence))

@@ -34,6 +34,8 @@ where = ["src"]
 [tool.ruff]
 line-length = 110
 target-version = "py312"
+# Review-benchmark fixtures are deliberately flawed sample projects, not code of this package.
+extend-exclude = ["evals/cases"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]

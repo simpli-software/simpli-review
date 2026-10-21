@@ -13,10 +13,13 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from simpli_review.agent_prompt import finding_details
 from simpli_review.models import BlockDecision, CheckRow, Finding, ReviewResult, Severity
+
+if TYPE_CHECKING:
+    from simpli_review.verifier import Verification
 
 SUMMARY_MARKER = "<!-- simpli-review:summary -->"
 FINDING_MARKER = "<!-- simpli-review:finding"
@@ -77,6 +80,7 @@ def summary_body(
     override_label: str | None = None,
     config_changes: list[str] | None = None,
     config_source: str = "",
+    verification: Verification | None = None,
 ) -> str:
     score = result.confidence_score
     lines = [SUMMARY_MARKER, f"## {name}", ""]
@@ -115,6 +119,11 @@ def summary_body(
             lines += [f"- **{_BADGE[f.severity]}** `{f.path}:{f.line}` — {f.title}", f"  {_one_line(f.body)}"]
         lines.append("")
 
+    if verification is not None:
+        section = verification_section(verification, override_label)
+        if section:
+            lines += [section, ""]
+
     if agent_prompt:
         lines += [agent_prompt, ""]
 
@@ -133,6 +142,66 @@ def summary_body(
         f"React 👍/👎 on comments to tune future reviews · {rerun}</sub>"
     )
     return "\n".join(lines)
+
+
+def verification_section(v: Verification, override_label: str | None = None) -> str:
+    """What the verifier removed or changed, collapsed, for audit; and a visible note when checks failed.
+
+    Items carry no severity badge and sit inside <details>, so the per-PR memory never reads them back as
+    earlier findings (memory.summary_findings only reads the 'Issues outside the changed lines' list).
+    """
+    dropped, lowered, unverified = (
+        v.by_status("dropped"),
+        v.by_status("downgraded"),
+        v.by_status("unverified"),
+    )
+    out: list[str] = []
+    disputed = v.by_status("disputed")
+    if disputed:
+        n = len(disputed)
+        label = f"the `{_tick(override_label)}` label" if override_label else "the override label"
+        they, blocks = ("They", "block") if n != 1 else ("It", "blocks")
+        out += [
+            f"**Disputed:** the second check disputes {n} finding{'s' if n != 1 else ''} at the blocking "
+            f"severity. {they} still {blocks} the merge; add {label} if you agree with the second check.",
+            "",
+        ]
+        for c in disputed:
+            where = f"`{_tick(c.original.path)}:{c.original.line}`"
+            out.append(f"- Disputed {c.original.severity.value}: {where} — {_one_line(c.original.title)}. "
+                       f"Second check: {_one_line(c.reason)}")  # fmt: skip
+        out.append("")
+    if unverified:
+        n = len(unverified)
+        plural = n != 1
+        out.append(
+            f"⚠️ {n} finding{'s' if plural else ''} could not be verified and "
+            f"{'were' if plural else 'was'} kept as the reviewer wrote {'them' if plural else 'it'}."
+        )
+    if dropped or lowered:
+        if out:
+            out.append("")
+        n = len(dropped)
+        summary = f"{n} candidate{'s' if n != 1 else ''} dropped by the verifier"
+        if lowered:
+            summary += f", {len(lowered)} downgraded"
+        out += [f"<details><summary>{summary}</summary>", ""]
+        for c in dropped:
+            where = f"`{_tick(c.original.path)}:{c.original.line}`"
+            out.append(f"- Dropped: {where} — {_one_line(c.original.title)}. Reason: {_one_line(c.reason)}")
+        for c in lowered:
+            where = f"`{_tick(c.original.path)}:{c.original.line}`"
+            change = f"{c.original.severity.value} to {c.finding.severity.value if c.finding else '?'}"
+            title, reason = _one_line(c.original.title), _one_line(c.reason)
+            out.append(f"- Downgraded {change}: {where} — {title}. Reason: {reason}")
+        if v.summary == "rewritten":
+            out += ["", "The summary and confidence score above were updated after these changes."]
+        out += ["", "</details>"]
+    return "\n".join(out).strip("\n")
+
+
+def _tick(text: str) -> str:
+    return text.replace("`", "")
 
 
 def checks_table(rows: list[CheckRow]) -> str:
